@@ -74,6 +74,27 @@ async fn run_cli() -> color_eyre::Result<()> {
     let mailboxes = cli_app.run(&mut checkpoint).await?;
 
     info!("finished fetching, got [{}] mailboxes in total", mailboxes.len());
+
+    // --- DUMP RAW CSV ---
+    let raw_out_file = "result/raw_addresses.csv";
+    info!("saving RAW records (before Smarty verification) to [{}]", raw_out_file);
+    if let Ok(mut wtr) = csv::Writer::from_path(raw_out_file) {
+        let _ = wtr.write_record(&["name", "street", "city", "state", "zip", "price", "link"]);
+        for m in &mailboxes {
+            let _ = wtr.write_record(&[
+                &m.name,
+                &m.address.line1,
+                &m.address.city,
+                &m.address.state,
+                &m.address.full_zip(),
+                &m.price,
+                &m.link,
+            ]);
+        }
+        let _ = wtr.flush();
+    }
+    // --------------------
+
     info!("begin to inquire mailbox address info...");
 
     let mailboxes_info = inquire_mailboxes_info(mailboxes).await?;
@@ -221,6 +242,26 @@ async fn start_crawling(app_data: web::Data<AppData>) -> impl Responder {
     match result {
         Ok(mailboxes) => {
             let total_processed = mailboxes.len();
+            
+            // --- DUMP RAW CSV ---
+            let raw_out_file = "result/raw_addresses.csv";
+            if let Ok(mut wtr) = csv::Writer::from_path(raw_out_file) {
+                let _ = wtr.write_record(&["name", "street", "city", "state", "zip", "price", "link"]);
+                for m in &mailboxes {
+                    let _ = wtr.write_record(&[
+                        &m.name,
+                        &m.address.line1,
+                        &m.address.city,
+                        &m.address.state,
+                        &m.address.full_zip(),
+                        &m.price,
+                        &m.link,
+                    ]);
+                }
+                let _ = wtr.flush();
+            }
+            // --------------------
+
             let mut state = app_data.state.lock().unwrap();
             state.status = "正在查询地址信息...".to_string();
             
