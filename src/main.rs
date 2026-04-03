@@ -285,7 +285,8 @@ async fn run_web_server() -> color_eyre::Result<()> {
         }),
     });
     
-    println!("Starting web server at http://127.0.0.1:8080");
+    println!("Starting web server at http://0.0.0.0:8080");
+    println!("Access via your public IP: http://<YOUR_IP>:8080");
     println!("CTRL+C to exit");
     
     HttpServer::new(move || {
@@ -297,7 +298,7 @@ async fn run_web_server() -> color_eyre::Result<()> {
             .service(start_crawling)
             .service(Files::new("/", "./web").index_file("index.html"))
     })
-    .bind("127.0.0.1:8080")?
+    .bind("0.0.0.0:8080")?
     .run()
     .await?;
     
