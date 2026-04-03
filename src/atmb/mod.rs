@@ -17,9 +17,31 @@ mod page;
 pub mod model;
 
 const BASE_URL: &str = "https://www.anytimemailbox.com";
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
-
 const US_HOME_PAGE_URL: &str = "/l/usa";
+
+static USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+];
+
+/// 从预设池中随机选取一个浏览器 User-Agent。
+fn get_random_user_agent() -> &'static str {
+    use rand::Rng;
+    let idx = rand::thread_rng().gen_range(0..USER_AGENTS.len());
+    USER_AGENTS[idx]
+}
+
+/// 返回 5000–12000 ms 之间均匀分布的随机延时（毫秒）。
+fn get_random_delay() -> u64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(5_000u64..=12_000u64)
+}
+
 
 /// HTTP client for obtaining information from ATMB
 struct ATMBClient {
@@ -50,7 +72,7 @@ impl ATMBClient {
 
     fn default_headers() -> HeaderMap {
         let mut map = HeaderMap::new();
-        map.insert(USER_AGENT, HeaderValue::from_static(UA));
+        map.insert(USER_AGENT, HeaderValue::from_static(get_random_user_agent()));
         map
     }
 
