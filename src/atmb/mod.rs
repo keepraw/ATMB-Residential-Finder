@@ -2,16 +2,14 @@ use color_eyre::eyre::{bail, eyre};
 use futures::StreamExt;
 use log::info;
 use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT_LANGUAGE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use tokio::time::{sleep, Duration};
 use crate::atmb::model::Mailbox;
 use crate::atmb::page::{CountryPage, LocationDetailPage, StatePage};
 use crate::checkpoint::Checkpoint;
 use crate::utils::retry_wrapper;
 
-/// 每次向 ATMB 发出详情页请求后的等待时长（毫秒）。
-/// 调低此值会加快速度但更容易触发速率限制；调高则更安全。
-const DETAIL_PAGE_DELAY_MS: u64 = 1500;
+
 
 mod page;
 pub mod model;
@@ -42,6 +40,32 @@ fn get_random_delay() -> u64 {
     rand::thread_rng().gen_range(5_000u64..=12_000u64)
 }
 
+static REFERERS: &[&str] = &[
+    "https://www.google.com/",
+    "https://www.bing.com/",
+    "https://duckduckgo.com/",
+    "https://www.anytimemailbox.com/l/usa",
+    "https://www.anytimemailbox.com/",
+];
+
+static ACCEPT_LANGUAGES: &[&str] = &[
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "en-GB,en;q=0.8,en-US;q=0.6",
+    "en-US,en;q=0.5",
+];
+
+/// 从预设池中随机选取一个 Referer。
+fn get_random_referer() -> &'static str {
+    use rand::Rng;
+    REFERERS[rand::thread_rng().gen_range(0..REFERERS.len())]
+}
+
+/// 从预设池中随机选取一个 Accept-Language。
+fn get_random_accept_language() -> &'static str {
+    use rand::Rng;
+    ACCEPT_LANGUAGES[rand::thread_rng().gen_range(0..ACCEPT_LANGUAGES.len())]
+}
 
 /// HTTP client for obtaining information from ATMB
 struct ATMBClient {
@@ -79,22 +103,49 @@ impl ATMBClient {
     /// get the content of a page
     ///
     /// * `url_path` - the path of the page, can be either a full URL or a relative path
+    ///
+    /// Per-request identity rotation: UA / Referer / Accept-Language are randomised on
+    /// every attempt. HTTP 429 / 403 responses are surfaced as errors so the caller's
+    /// retry_wrapper applies exponential backoff before trying again.
     async fn fetch_page(&self, url_path: &str) -> color_eyre::Result<String> {
-        let url = if url_path.starts_with("http") {
-            url_path
+        // Owned String so the async closure can borrow it cleanly across retries.
+        let url: String = if url_path.starts_with("http") {
+            url_path.to_string()
         } else {
-            &format!("{}{}", BASE_URL, url_path)
+            format!("{}{}", BASE_URL, url_path)
         };
-        Ok(
-            retry_wrapper(3, || async {
-                self.client
-                    .get(url)
-                    .send()
-                    .await?
-                    .text()
-                    .await
-            }).await?
-        )
+
+        retry_wrapper(5, || async {
+            // Rotate all three identity headers on every attempt.
+            let ua          = get_random_user_agent();
+            let referer     = get_random_referer();
+            let accept_lang = get_random_accept_language();
+
+            let response = self.client
+                .get(&url)
+                .header(USER_AGENT,      ua)
+                .header(REFERER,         referer)
+                .header(ACCEPT_LANGUAGE, accept_lang)
+                .send()
+                .await?;
+
+            let status = response.status();
+
+            // 429 Too Many Requests / 403 Forbidden → rate limited.
+            // Return Err so retry_wrapper triggers exponential backoff.
+            if status.as_u16() == 429 || status.as_u16() == 403 {
+                return Err(eyre!(
+                    "Rate limited by ATMB (HTTP {}) — will retry with backoff",
+                    status.as_u16()
+                ));
+            }
+
+            if !status.is_success() {
+                return Err(eyre!("Unexpected HTTP status {} for {}", status, url));
+            }
+
+            response.text().await.map_err(|e| eyre!("{}", e))
+        }).await
     }
 }
 
@@ -193,7 +244,8 @@ impl ATMBCrawl {
 
     /// 逐条（串行）抓取每个 mailbox 的 detail page，支持断点续传。
     ///
-    /// * 每次请求后等待 `DETAIL_PAGE_DELAY_MS` 毫秒，大幅降低被 ATMB 速率限制的概率。
+    /// * 每次请求后随机等待 5–12 秒（Timing Jitter）。
+    /// * 每 20–30 条成功抽取后，插入 60–120 秒長冷却（Batch Rest）。
     /// * 若 checkpoint 中已有该 link 的记录，直接复用，无需网络请求。
     /// * 每成功抓取一条，立即原子写入 checkpoint 文件，Ctrl+C 中断后可从断点继续。
     async fn update_street2_for_mailbox(
@@ -212,6 +264,14 @@ impl ATMBCrawl {
         }
 
         let mut results: Vec<Mailbox> = Vec::with_capacity(total);
+
+        // ── Batch Rest 状态 ──
+        // 每成功抓取 20–30 条（随机阈値）后，休息 60–120 秒。
+        let mut batch_success: u32 = 0;
+        let mut next_rest_at: u32 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(20u32..=30u32)
+        };
 
         for (idx, mut mailbox) in mailboxes.into_iter().enumerate() {
             let pos = format!("[{}/{}]", idx + 1, total);
@@ -240,6 +300,24 @@ impl ATMBCrawl {
                     }
                     mailbox.address.line1 = street;
                     results.push(mailbox);
+
+                    // ── Batch Rest 计数 ──
+                    batch_success += 1;
+                    if batch_success >= next_rest_at {
+                        let rest_secs = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(60u64..=120u64)
+                        };
+                        info!(
+                            "[Batch Rest] {} successful fetches — cooling down for {}s to mimic human browsing...",
+                            batch_success, rest_secs
+                        );
+                        sleep(Duration::from_secs(rest_secs)).await;
+                        // 重置计数器，随机选取下一个阈値
+                        batch_success = 0;
+                        use rand::Rng;
+                        next_rest_at = rand::thread_rng().gen_range(20u32..=30u32);
+                    }
                 }
                 Err(err) => {
                     log::warn!(
@@ -250,8 +328,11 @@ impl ATMBCrawl {
                 }
             }
 
-            // ── 速率限制：每条请求后固定等待，防止 IP 被封 ──
-            sleep(Duration::from_millis(DETAIL_PAGE_DELAY_MS)).await;
+            // ── Timing Jitter：每条请求后随机等待 5–12 秒（Uniform Distribution）
+            // 非确定性间隔让流量模式难以被识别为爬虫。
+            let delay_ms = get_random_delay();
+            log::debug!("Next request in {}ms ({:.1}s)", delay_ms, delay_ms as f64 / 1000.0);
+            sleep(Duration::from_millis(delay_ms)).await;
         }
 
         Ok(results)
