@@ -3,9 +3,15 @@ use futures::StreamExt;
 use log::info;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use tokio::time::{sleep, Duration};
 use crate::atmb::model::Mailbox;
 use crate::atmb::page::{CountryPage, LocationDetailPage, StatePage};
+use crate::checkpoint::Checkpoint;
 use crate::utils::retry_wrapper;
+
+/// 每次向 ATMB 发出详情页请求后的等待时长（毫秒）。
+/// 调低此值会加快速度但更容易触发速率限制；调高则更安全。
+const DETAIL_PAGE_DELAY_MS: u64 = 1500;
 
 mod page;
 pub mod model;
@@ -94,7 +100,7 @@ impl ATMBCrawl {
         Ok(states)
     }
     
-    pub async fn fetch_selected_states(&self, selected_states: &[String]) -> color_eyre::Result<Vec<Mailbox>> {
+    pub async fn fetch_selected_states(&self, selected_states: &[String], checkpoint: &mut Checkpoint) -> color_eyre::Result<Vec<Mailbox>> {
         // 获取国家页面
         let country_html = self.client.fetch_page(US_HOME_PAGE_URL).await?;
         let country_page = CountryPage::parse_html(&country_html)?;
@@ -132,13 +138,11 @@ impl ATMBCrawl {
             bail!("Some mailboxes cannot be fetched");
         }
 
-        // 访问每个邮箱的详细页面以获取地址行2
-        self.update_street2_for_mailbox(mailboxes).await.map_err(|e| {
-            eyre!("Some mailbox's detail cannot be fetched: {:?}", e)
-        })
+        // 访问每个邮箱的详细页面以获取地址行2（串行 + 断点续传）
+        self.update_street2_for_mailbox(mailboxes, checkpoint).await
     }
     
-    pub async fn fetch(&self) -> color_eyre::Result<Vec<Mailbox>> {
+    pub async fn fetch(&self, checkpoint: &mut Checkpoint) -> color_eyre::Result<Vec<Mailbox>> {
         // we're only interested in US, so hardcode here.
         let country_html = self.client.fetch_page(US_HOME_PAGE_URL).await?;
         let country_page = CountryPage::parse_html(&country_html)?;
@@ -161,45 +165,74 @@ impl ATMBCrawl {
             bail!("Some mailboxes cannot be fetched");
         }
 
-        // visit every mailbox detail page to get the address line 2
-        self.update_street2_for_mailbox(mailboxes).await.map_err(|e| {
-            eyre!("Some mailbox's detail cannot be fetched: {:?}", e)
-        })
+        // 逐条抓取 detail 页面（串行 + 断点续传）
+        self.update_street2_for_mailbox(mailboxes, checkpoint).await
     }
 
-    async fn update_street2_for_mailbox(&self, mailboxes: Vec<Mailbox>) -> color_eyre::Result<Vec<Mailbox>> {
-        let total_mailboxes = mailboxes.len();
-
-        let mailboxes = futures::stream::iter(mailboxes).enumerate().map(|(idx, mut mailbox)| {
-            let link = mailbox.link.clone();
-            async move {
-                let fut = || async {
-                    info!("[{}/{}] fetching the detail page of [{}]...", idx + 1, total_mailboxes, mailbox.name);
-                    let detail_page = self.fetch_location_detail_page(&mailbox.link).await?;
-                    mailbox.address.line1 = detail_page.street();
-                    Result::<_, color_eyre::eyre::Error>::Ok(mailbox)
-                };
-                fut().await
-                    .map_err(|err| {
-                        let err = eyre!("cannot fetch detail page for: [{}]: {:?}", link, err);
-                        log::error!("{:?}", err);
-                        err
-                    })
-            }
-        })
-            .buffer_unordered(10)
-            .collect::<Vec<_>>()
-            .await;
-
-        let (suc_list, err_list): (Vec<_>, Vec<_>) = mailboxes.into_iter().partition(Result::is_ok);
-        let suc_list = suc_list.into_iter().filter_map(Result::ok).collect::<Vec<_>>();
-        let err_list = err_list.into_iter().filter_map(Result::err).collect::<Vec<_>>();
-
-        if !err_list.is_empty() {
-            bail!("{:#?}", err_list);
-        } else {
-            Ok(suc_list)
+    /// 逐条（串行）抓取每个 mailbox 的 detail page，支持断点续传。
+    ///
+    /// * 每次请求后等待 `DETAIL_PAGE_DELAY_MS` 毫秒，大幅降低被 ATMB 速率限制的概率。
+    /// * 若 checkpoint 中已有该 link 的记录，直接复用，无需网络请求。
+    /// * 每成功抓取一条，立即原子写入 checkpoint 文件，Ctrl+C 中断后可从断点继续。
+    async fn update_street2_for_mailbox(
+        &self,
+        mailboxes: Vec<Mailbox>,
+        checkpoint: &mut Checkpoint,
+    ) -> color_eyre::Result<Vec<Mailbox>> {
+        let total = mailboxes.len();
+        let resumed = checkpoint.completed_count();
+        if resumed > 0 {
+            info!(
+                "Checkpoint loaded: {} already done, up to {} remaining.",
+                resumed,
+                total.saturating_sub(resumed)
+            );
         }
+
+        let mut results: Vec<Mailbox> = Vec::with_capacity(total);
+
+        for (idx, mut mailbox) in mailboxes.into_iter().enumerate() {
+            let pos = format!("[{}/{}]", idx + 1, total);
+
+            // ── 断点续传：若已在 checkpoint 中则跳过网络请求 ──
+            if let Some(cached_street) = checkpoint.get_completed(&mailbox.link) {
+                info!("{} [resumed] {} — using checkpoint data", pos, mailbox.name);
+                mailbox.address.line1 = cached_street.to_string();
+                results.push(mailbox);
+                continue;
+            }
+
+            info!("{} fetching detail page of [{}]...", pos, mailbox.name);
+
+            // ── 带指数退避重试的请求（最多 5 次）──
+            let fetch_result = retry_wrapper(5, || async {
+                self.fetch_location_detail_page(&mailbox.link).await
+            }).await;
+
+            match fetch_result {
+                Ok(detail_page) => {
+                    let street = detail_page.street();
+                    // 原子写入 checkpoint，即使之后 Ctrl+C 也不丢失此条
+                    if let Err(e) = checkpoint.save_one(&mailbox.link, &street) {
+                        log::warn!("{} failed to save checkpoint entry: {:?}", pos, e);
+                    }
+                    mailbox.address.line1 = street;
+                    results.push(mailbox);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "{} skipped [{}] after all retries failed: {:?}",
+                        pos, mailbox.name, err
+                    );
+                    // 跳过此条，继续处理下一条，不让单条失败终止整个任务
+                }
+            }
+
+            // ── 速率限制：每条请求后固定等待，防止 IP 被封 ──
+            sleep(Duration::from_millis(DETAIL_PAGE_DELAY_MS)).await;
+        }
+
+        Ok(results)
     }
 
     async fn fetch_state_pages(&self, country_page: &CountryPage<'_>) -> color_eyre::Result<Vec<StatePage>> {
@@ -207,12 +240,17 @@ impl ATMBCrawl {
         let state_pages: Vec<color_eyre::Result<StatePage>> = futures::stream::iter(&country_page.states).enumerate().map(|(idx, state_html_info)| {
             info!("[{}/{total_states}] fetching [{}] state page...", idx + 1, state_html_info.name());
             async move {
+                // 错峰延时：两两并发，同一批内的第二个请求延迟 500ms，错开发出
+                let stagger_ms = ((idx % 2) as u64) * 500;
+                if stagger_ms > 0 {
+                    sleep(Duration::from_millis(stagger_ms)).await;
+                }
                 let state_html = self.client.fetch_page(state_html_info.url()).await?;
                 Ok(StatePage::parse_html(&state_html)?)
             }
         })
-            // limit concurrent requests to 5
-            .buffer_unordered(5)
+            // 州列表只有几十个，保持 2 并发即可；每批内有 500ms 错峰
+            .buffer_unordered(2)
             .collect()
             .await;
 

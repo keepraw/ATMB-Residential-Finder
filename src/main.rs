@@ -4,6 +4,7 @@ use futures::StreamExt;
 use log::{error, info};
 use crate::atmb::ATMBCrawl;
 use crate::atmb::model::Mailbox;
+use crate::checkpoint::Checkpoint;
 use crate::record::Record;
 use crate::smarty::{AdditionalInfo, SmartyClientProxy};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
@@ -11,6 +12,7 @@ use actix_files::Files;
 use serde::{Deserialize, Serialize};
 
 mod atmb;
+mod checkpoint;
 mod record;
 mod smarty;
 mod utils;
@@ -65,7 +67,11 @@ async fn main() {
 async fn run_cli() -> color_eyre::Result<()> {
     // 使用CLI应用获取用户选择的州
     let cli_app = cli::CliApp::new()?;
-    let mailboxes = cli_app.run().await?;
+
+    // 加载断点续传文件（不存在则从头开始）
+    let mut checkpoint = Checkpoint::load("result/progress.json")?;
+
+    let mailboxes = cli_app.run(&mut checkpoint).await?;
 
     info!("finished fetching, got [{}] mailboxes in total", mailboxes.len());
     info!("begin to inquire mailbox address info...");
@@ -196,11 +202,20 @@ async fn start_crawling(app_data: web::Data<AppData>) -> impl Responder {
         state.status = "正在爬取数据...".to_string();
         selected_states = state.selected_states.clone();
     }
-    
+
+    // 加载断点续传文件（不存在则从头开始）
+    let mut checkpoint = match Checkpoint::load("result/progress.json") {
+        Ok(c) => c,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("无法加载断点文件: {}", e));
+        }
+    };
+
     let result = if selected_states.is_empty() {
-        atmb.fetch().await
+        atmb.fetch(&mut checkpoint).await
     } else {
-        atmb.fetch_selected_states(&selected_states).await
+        atmb.fetch_selected_states(&selected_states, &mut checkpoint).await
     };
     
     match result {

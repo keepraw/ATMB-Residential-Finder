@@ -34,8 +34,10 @@ fn map_to_backoff_err<E>(err: E, cur_times: usize, max_times: usize) -> backoff:
 #[inline]
 fn backoff_config() -> ExponentialBackoff {
     ExponentialBackoff {
-        initial_interval: Duration::from_millis(1000),
-        max_interval: Duration::from_millis(5000),
+        // 初始等待 2s，应对 ATMB 速率限制后恢复较慢的情况
+        initial_interval: Duration::from_millis(2000),
+        // 最大等待 30s，指数退避上限
+        max_interval: Duration::from_millis(30000),
         ..Default::default()
     }
 }

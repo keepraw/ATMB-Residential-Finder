@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use log::info;
 use crate::atmb::ATMBCrawl;
 use crate::atmb::model::Mailbox;
+use crate::checkpoint::Checkpoint;
 
 pub struct CliApp {
     atmb: ATMBCrawl,
@@ -14,7 +15,7 @@ impl CliApp {
         })
     }
 
-    pub async fn run(&self) -> color_eyre::Result<Vec<Mailbox>> {
+    pub async fn run(&self, checkpoint: &mut Checkpoint) -> color_eyre::Result<Vec<Mailbox>> {
         // 获取所有可用的州
         let states = self.atmb.get_available_states().await?;
         
@@ -23,10 +24,10 @@ impl CliApp {
         
         if selected_states.is_empty() {
             info!("No states selected, fetching all states...");
-            self.atmb.fetch().await
+            self.atmb.fetch(checkpoint).await
         } else {
             info!("Fetching selected states: {:?}", selected_states);
-            self.atmb.fetch_selected_states(&selected_states).await
+            self.atmb.fetch_selected_states(&selected_states, checkpoint).await
         }
     }
 

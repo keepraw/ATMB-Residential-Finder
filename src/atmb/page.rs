@@ -185,7 +185,8 @@ pub struct LocationDetailPage {
 impl LocationDetailPage {
     pub fn parse_html(html: &str) -> color_eyre::Result<Self> {
         let document = Html::parse_document(html);
-        let address_container = document.select(&LOCATION_DETAIL_SELECTOR).next().unwrap();
+        let address_container = document.select(&LOCATION_DETAIL_SELECTOR).next()
+            .ok_or_else(|| eyre!("Cannot find address container in detail page - the page may be a rate-limit error page or the site structure has changed. HTML snippet: {}", &html[..html.len().min(500)]))?;
         let div_selector = Selector::parse("div").unwrap();
 
         let lines = address_container.select(&div_selector)
